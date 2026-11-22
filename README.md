@@ -20,13 +20,12 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 - 配置：`/etc/sekai/config.yml`（权限 600）
 - 凭证：`/etc/sekai/credentials.env`（token 单独存放，配置里用 `token_env: MACHINE_TOKEN` 引用）
 - 服务：systemd 下为 `sekai.service`（`Restart=always`，开机自启）；Alpine/OpenRC 下为 `/etc/init.d/sekai`（`rc-update add sekai default`，失败 10s 后强杀）
-- 健康检查：`http://127.0.0.1:65530/healthz`
+- 服务状态检查：安装脚本在启动后等待服务进入 active 状态（不再依赖独立探活端口）
 
 可选参数：
 
 ```bash
 --version v0.1.0              # 指定版本（默认 latest）
---health-port 65530           # 探活端口，0 关闭
 ```
 
 日志默认关闭：生成的配置里 `log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。

@@ -25,7 +25,6 @@ LOG_FILE="/var/log/${APP_NAME}.log"
 ERR_LOG_FILE="/var/log/${APP_NAME}.err.log"
 
 DEFAULT_VERSION="latest"
-DEFAULT_HEALTH_PORT="65530"
 DEFAULT_LOG_LEVEL="silent"
 
 ACTION="install"
@@ -34,7 +33,6 @@ TOKEN=""
 MACHINE_ID=""
 LICENSE_KEY=""
 RELEASE_VERSION="$DEFAULT_VERSION"
-HEALTH_PORT="$DEFAULT_HEALTH_PORT"
 LOG_LEVEL="$DEFAULT_LOG_LEVEL"
 PURGE=0
 YES=0
@@ -70,7 +68,6 @@ usage() {
 
   OPTIONAL:
     --version         版本号或 latest（默认 latest）
-    --health-port     本地探活端口（默认 65530，0 关闭）
     --purge           uninstall 时删除 /etc/sekai
     --yes, -y         非交互确认
     --help, -h        显示帮助
@@ -134,7 +131,6 @@ parse_args() {
             --machine-id)          MACHINE_ID="${2:-}"; shift 2 ;;
             --license-key)         LICENSE_KEY="${2:-}"; shift 2 ;;
             --version)             RELEASE_VERSION="${2:-}"; shift 2 ;;
-            --health-port)         HEALTH_PORT="${2:-}"; shift 2 ;;
             --purge)               PURGE=1; shift ;;
             --yes|-y)              YES=1; shift ;;
             --help|-h)             ACTION="help"; shift ;;
@@ -311,9 +307,6 @@ validate_install() {
         http://*|https://*) ;;
         *) PANEL_URL="https://${PANEL_URL}" ;;
     esac
-    case "$HEALTH_PORT" in
-        ''|*[!0-9]*) log_error "--health-port 必须是 0-65535 的整数"; exit 1 ;;
-    esac
 }
 
 yaml_quote() {
@@ -352,7 +345,7 @@ stage_binary() {
 }
 
 render_config() {
-    local panel_yaml health license_block=""
+    local panel_yaml license_block=""
     panel_yaml="$(yaml_quote "$PANEL_URL")"
     if [ -n "$LICENSE_KEY" ]; then
         license_block=$(cat <<EOF
@@ -390,7 +383,6 @@ ws:
 
 node:
   report_interval: 60
-  health_port: ${HEALTH_PORT}
 
 limits:
   device_limit: true
@@ -477,11 +469,10 @@ install_files() {
     daemon_reload
 }
 
-wait_for_health() {
-    if [ "$HEALTH_PORT" = "0" ]; then return 0; fi
+wait_for_service() {
     local i=0
     while [ "$i" -lt 30 ]; do
-        if service_is_active && http_ok "http://127.0.0.1:${HEALTH_PORT}/healthz"; then
+        if service_is_active; then
             return 0
         fi
         sleep 1; i=$((i + 1))
@@ -492,8 +483,8 @@ wait_for_health() {
 start_service() {
     service_enable
     service_restart
-    if ! wait_for_health; then
-        log_error "服务健康检查失败"
+    if ! wait_for_service; then
+        log_error "服务启动失败"
         show_logs
         return 1
     fi
@@ -513,9 +504,6 @@ perform_install() {
     log_info "服务: ${SERVICE_NAME}（${INIT}）"
     log_info "配置: ${CONFIG_FILE}（权限 600）"
     log_info "凭证: ${CREDENTIALS_FILE}（权限 600）"
-    if [ "$HEALTH_PORT" != "0" ]; then
-        log_info "健康检查: http://127.0.0.1:${HEALTH_PORT}/healthz"
-    fi
     log_info "授权: 已写入 license.key 并启用在线校验"
 }
 
