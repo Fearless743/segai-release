@@ -21,10 +21,12 @@ DATA_DIR="${INSTALL_ROOT}/data"
 BINARY_PATH="/usr/local/bin/${APP_NAME}"
 SERVICE_NAME="${APP_NAME}"
 SERVICE_PATH=""
+LOG_FILE="/var/log/${APP_NAME}.log"
+ERR_LOG_FILE="/var/log/${APP_NAME}.err.log"
 
 DEFAULT_VERSION="latest"
 DEFAULT_HEALTH_PORT="65530"
-DEFAULT_LOG_LEVEL="info"
+DEFAULT_LOG_LEVEL="silent"
 
 ACTION="install"
 PANEL_URL=""
@@ -57,6 +59,7 @@ usage() {
     upgrade      升级二进制并重启服务
     uninstall    卸载服务与二进制（默认保留配置，--purge 一并删除）
     status       查看当前安装状态
+    logs         实时跟随服务日志（Ctrl+C 退出）
     help         显示帮助
 
   REQUIRED (install):
@@ -68,7 +71,6 @@ usage() {
     --license-key     License Key（可选；提供则启用商业授权校验）
     --version         版本号或 latest（默认 latest）
     --health-port     本地探活端口（默认 65530，0 关闭）
-    --log-level       日志级别（默认 info）
     --purge           uninstall 时删除 /etc/sekai
     --yes, -y         非交互确认
     --help, -h        显示帮助
@@ -126,14 +128,13 @@ trap cleanup EXIT
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            install|upgrade|uninstall|status|help) ACTION="$1"; shift ;;
+            install|upgrade|uninstall|status|logs|help) ACTION="$1"; shift ;;
             --panel|-a|--api)      PANEL_URL="${2:-}"; shift 2 ;;
             --token|-t)            TOKEN="${2:-}"; shift 2 ;;
             --machine-id)          MACHINE_ID="${2:-}"; shift 2 ;;
             --license-key)         LICENSE_KEY="${2:-}"; shift 2 ;;
             --version)             RELEASE_VERSION="${2:-}"; shift 2 ;;
             --health-port)         HEALTH_PORT="${2:-}"; shift 2 ;;
-            --log-level)           LOG_LEVEL="${2:-}"; shift 2 ;;
             --purge)               PURGE=1; shift ;;
             --yes|-y)              YES=1; shift ;;
             --help|-h)             ACTION="help"; shift ;;
@@ -233,7 +234,14 @@ show_logs() {
     if [ "$INIT" = "systemd" ] && command -v journalctl >/dev/null 2>&1; then
         journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
     else
-        tail -n 30 "/var/log/${APP_NAME}.log" 2>/dev/null || true
+        if [ -f "$LOG_FILE" ]; then
+            echo "--- ${LOG_FILE} ---"
+            tail -n 30 "$LOG_FILE" 2>/dev/null || true
+        fi
+        if [ -f "$ERR_LOG_FILE" ]; then
+            echo "--- ${ERR_LOG_FILE} ---"
+            tail -n 30 "$ERR_LOG_FILE" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -369,6 +377,7 @@ machine:
   token_env: MACHINE_TOKEN
 
 log:
+  # 默认 silent（完全不输出日志）；需要日志时请手动修改本文件为 info/debug/warn/error
   level: $(yaml_quote "$LOG_LEVEL")
 
 ws:
@@ -427,8 +436,8 @@ command="${BINARY_PATH}"
 command_args="-c ${CONFIG_FILE}"
 command_background=true
 pidfile="/run/${APP_NAME}.pid"
-output_log="/var/log/${APP_NAME}.log"
-error_log="/var/log/${APP_NAME}.log"
+output_log="${LOG_FILE}"
+error_log="${ERR_LOG_FILE}"
 # Graceful shutdown: allow 10s for connection drain before SIGKILL.
 retry="TERM/10/KILL/5"
 
@@ -444,7 +453,7 @@ start_pre() {
         set +a
     fi
     mkdir -p ${DATA_DIR}
-    touch "/var/log/${APP_NAME}.log"
+    touch ${LOG_FILE} ${ERR_LOG_FILE}
 }
 EOF
     fi
@@ -536,6 +545,35 @@ perform_uninstall() {
         log_info "已卸载（含配置目录 ${INSTALL_ROOT}）"
     else
         log_info "已卸载（配置保留在 ${INSTALL_ROOT}）"
+    fi
+}
+
+perform_logs() {
+    detect_init
+    if [ "$(id -u)" -ne 0 ]; then
+        log_warn "读取服务日志通常需要 root，建议加 sudo"
+    fi
+    if [ "$INIT" = "systemd" ]; then
+        if ! command -v journalctl >/dev/null 2>&1; then
+            log_error "未找到 journalctl"; exit 1
+        fi
+        journalctl -u "${SERVICE_NAME}.service" -n 50 --no-pager || true
+        echo "--- 实时日志 (Ctrl+C 退出) ---"
+        journalctl -u "${SERVICE_NAME}.service" -f || true
+    else
+        touch "$LOG_FILE" "$ERR_LOG_FILE" 2>/dev/null || true
+        if [ -f "$LOG_FILE" ]; then
+            echo "--- ${LOG_FILE} (最近 50 行) ---"
+            tail -n 50 "$LOG_FILE" 2>/dev/null || true
+        fi
+        if [ -f "$ERR_LOG_FILE" ]; then
+            echo "--- ${ERR_LOG_FILE} (最近 50 行) ---"
+            tail -n 50 "$ERR_LOG_FILE" 2>/dev/null || true
+        fi
+        echo "--- 实时日志 (Ctrl+C 退出) ---"
+        tail -F -n 0 "$LOG_FILE" "$ERR_LOG_FILE" 2>/dev/null \
+            || tail -f -n 0 "$LOG_FILE" "$ERR_LOG_FILE" 2>/dev/null \
+            || true
     fi
 }
 
