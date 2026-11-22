@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sekai 一键安装 / 升级 / 卸载脚本（machine 模式）
+# sekai 一键安装 / 升级 / 卸载脚本（machine 模式，支持 systemd 与 OpenRC）
 #
 #   curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/install.sh \
 #     | sudo bash -s -- --panel https://panel.example.com --token TOKEN --machine-id 1
@@ -20,7 +20,7 @@ CREDENTIALS_FILE="${INSTALL_ROOT}/credentials.env"
 DATA_DIR="${INSTALL_ROOT}/data"
 BINARY_PATH="/usr/local/bin/${APP_NAME}"
 SERVICE_NAME="${APP_NAME}"
-SERVICE_PATH="/etc/systemd/system/${APP_NAME}.service"
+SERVICE_PATH=""
 
 DEFAULT_VERSION="latest"
 DEFAULT_HEALTH_PORT="65530"
@@ -40,6 +40,12 @@ TMP_DIR=""
 BACKUP_DIR=""
 SERVICE_EXISTED=0
 CLEANUP_DONE=0
+
+INIT=""
+ASSET=""
+LIBC=""
+RC_SERVICE_BIN=""
+RC_UPDATE_BIN=""
 
 usage() {
     cat <<'HELP'
@@ -67,6 +73,8 @@ usage() {
     --yes, -y         非交互确认
     --help, -h        显示帮助
 
+  支持：glibc（systemd）、Alpine/musl（OpenRC）。Alpine 需先安装 bash。
+
   EXAMPLES:
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXX-XXXX
@@ -82,6 +90,10 @@ cleanup() {
     return 0
 }
 
+service_mode() {
+    if [ "$INIT" = "systemd" ]; then echo 644; else echo 755; fi
+}
+
 on_error() {
     local code=$? line=${1:-unknown}
     if [ "$code" -ne 0 ]; then
@@ -92,14 +104,16 @@ on_error() {
             [ -f "$BACKUP_DIR/credentials.env" ] && install -m 600 "$BACKUP_DIR/credentials.env" "$CREDENTIALS_FILE" || rm -f "$CREDENTIALS_FILE"
             [ -f "$BACKUP_DIR/binary" ] && install -m 755 "$BACKUP_DIR/binary" "$BINARY_PATH" || rm -f "$BINARY_PATH"
             if [ "$SERVICE_EXISTED" -eq 1 ]; then
-                if [ -f "$BACKUP_DIR/service" ]; then install -m 644 "$BACKUP_DIR/service" "$SERVICE_PATH"; fi
-                systemctl daemon-reload >/dev/null 2>&1 || true
-                systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+                if [ -f "$BACKUP_DIR/service" ]; then
+                    install -m "$(service_mode)" "$BACKUP_DIR/service" "$SERVICE_PATH"
+                fi
+                daemon_reload || true
+                service_restart >/dev/null 2>&1 || true
             else
-                systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-                systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+                service_stop >/dev/null 2>&1 || true
+                service_disable >/dev/null 2>&1 || true
                 rm -f "$SERVICE_PATH"
-                systemctl daemon-reload >/dev/null 2>&1 || true
+                daemon_reload || true
             fi
         fi
     fi
@@ -132,30 +146,149 @@ check_root() {
     [ "$(id -u)" -eq 0 ] || { log_error "请用 root 或 sudo 运行"; exit 1; }
 }
 
-check_systemd() {
-    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] || {
-        log_error "未检测到 systemd；本脚本目前仅支持 systemd 系统"; exit 1;
-    }
+find_rc() {
+    RC_SERVICE_BIN=""; RC_UPDATE_BIN=""
+    local c
+    for c in rc-service /sbin/rc-service /usr/sbin/rc-service; do
+        if command -v "$c" >/dev/null 2>&1; then RC_SERVICE_BIN="$c"; break; fi
+    done
+    for c in rc-update /sbin/rc-update /usr/sbin/rc-update; do
+        if command -v "$c" >/dev/null 2>&1; then RC_UPDATE_BIN="$c"; break; fi
+    done
+}
+
+detect_init() {
+    INIT=""
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        INIT="systemd"
+        SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+        log_info "检测到 init 系统: systemd"
+        return
+    fi
+    find_rc
+    if [ -n "$RC_SERVICE_BIN" ] && [ -n "$RC_UPDATE_BIN" ]; then
+        INIT="openrc"
+        SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
+        log_info "检测到 init 系统: OpenRC"
+        return
+    fi
+    log_error "未检测到 systemd 或 OpenRC（找不到 systemctl / rc-service）"
+    exit 1
+}
+
+daemon_reload() {
+    if [ "$INIT" = "systemd" ]; then systemctl daemon-reload; fi
+}
+
+service_start() {
+    case "$INIT" in
+        systemd) systemctl start "$SERVICE_NAME" ;;
+        openrc)  "$RC_SERVICE_BIN" "$SERVICE_NAME" start ;;
+    esac
+}
+
+service_stop() {
+    case "$INIT" in
+        systemd) systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true ;;
+        openrc)  "$RC_SERVICE_BIN" "$SERVICE_NAME" stop >/dev/null 2>&1 || true ;;
+    esac
+}
+
+service_restart() {
+    case "$INIT" in
+        systemd) systemctl restart "$SERVICE_NAME" ;;
+        openrc)  "$RC_SERVICE_BIN" "$SERVICE_NAME" restart ;;
+    esac
+}
+
+service_enable() {
+    case "$INIT" in
+        systemd) systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true ;;
+        openrc)  "$RC_UPDATE_BIN" add "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
+    esac
+}
+
+service_disable() {
+    case "$INIT" in
+        systemd) systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true ;;
+        openrc)  "$RC_UPDATE_BIN" del "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
+    esac
+}
+
+service_is_active() {
+    case "$INIT" in
+        systemd) systemctl is-active --quiet "$SERVICE_NAME" ;;
+        openrc)  "$RC_SERVICE_BIN" "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_status() {
+    case "$INIT" in
+        systemd) systemctl status "${SERVICE_NAME}.service" --no-pager || true ;;
+        openrc)  "$RC_SERVICE_BIN" "$SERVICE_NAME" status || true ;;
+    esac
+}
+
+show_logs() {
+    if [ "$INIT" = "systemd" ] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
+    else
+        tail -n 30 "/var/log/${APP_NAME}.log" 2>/dev/null || true
+    fi
+}
+
+download() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --retry 3 -o "$out" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$out" "$url"
+    else
+        log_error "需要 curl 或 wget 才能下载"; return 1
+    fi
+}
+
+http_ok() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS "$url" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O /dev/null "$url" 2>/dev/null
+    else
+        return 1
+    fi
 }
 
 detect_asset() {
-    local os arch
+    local os arch line
     os="$(uname -s)"; arch="$(uname -m)"
     case "$os" in
         Linux)  os=linux  ;;
-        Darwin) log_error "macOS 请用手动下载方式（本脚本面向 systemd 服务器）"; exit 1 ;;
-        *) log_error "不支持的操作系统: $os"; exit 1 ;;
+        *) log_error "不支持的操作系统: $os（本脚本仅支持 Linux 服务器）"; exit 1 ;;
     esac
     case "$arch" in
         x86_64|amd64)  arch=x86_64  ;;
         aarch64|arm64) arch=aarch64 ;;
         *) log_error "不支持的架构: $arch"; exit 1 ;;
     esac
-    case "${os}-${arch}" in
-        linux-x86_64)  ASSET="sekai-x86_64-unknown-linux-gnu.tar.gz" ;;
-        linux-aarch64) ASSET="sekai-aarch64-unknown-linux-gnu.tar.gz" ;;
-        *) log_error "无匹配的安装包: ${os}-${arch}"; exit 1 ;;
+
+    LIBC="gnu"
+    if [ -f /etc/alpine-release ]; then
+        LIBC="musl"
+    elif grep -qi '^ID=alpine' /etc/os-release 2>/dev/null; then
+        LIBC="musl"
+    elif ldd --version 2>&1 | grep -qi musl; then
+        LIBC="musl"
+    fi
+
+    case "${os}-${LIBC}-${arch}" in
+        linux-gnu-x86_64)   ASSET="sekai-x86_64-unknown-linux-gnu.tar.gz" ;;
+        linux-gnu-aarch64)  ASSET="sekai-aarch64-unknown-linux-gnu.tar.gz" ;;
+        linux-musl-x86_64)  ASSET="sekai-x86_64-unknown-linux-musl.tar.gz" ;;
+        linux-musl-aarch64) ASSET="sekai-aarch64-unknown-linux-musl.tar.gz" ;;
+        *) log_error "无匹配的安装包: ${os}-${LIBC}-${arch}"; exit 1 ;;
     esac
+    log_info "平台: ${os}/${arch}，libc: ${LIBC}"
 }
 
 validate_install() {
@@ -174,14 +307,12 @@ validate_install() {
     esac
 }
 
-# YAML 双引号转义
 yaml_quote() {
     local s="${1//\\/\\\\}"
     s="${s//\"/\\\"}"
     printf '"%s"' "$s"
 }
 
-# systemd EnvironmentFile 值转义（双引号内）
 env_quote() {
     local s="${1//\\/\\\\}"
     s="${s//\"/\\\"}"
@@ -204,7 +335,7 @@ stage_binary() {
     fi
     path="${TMP_DIR}/${ASSET}"
     log_step "下载 ${RELEASE_VERSION} (${ASSET})"
-    curl -fSL --retry 3 -o "$path" "$url" || { log_error "下载失败: $url"; exit 1; }
+    download "$url" "$path" || { log_error "下载失败: $url"; exit 1; }
     tar tzf "$path" >/dev/null 2>&1 || { log_error "压缩包损坏: $ASSET"; exit 1; }
     tar xzf "$path" -C "$TMP_DIR"
     [ -f "${TMP_DIR}/${APP_NAME}" ] || { log_error "压缩包内未找到 ${APP_NAME}"; exit 1; }
@@ -264,7 +395,8 @@ EOF
 }
 
 render_service() {
-    cat >"${TMP_DIR}/service" <<EOF
+    if [ "$INIT" = "systemd" ]; then
+        cat >"${TMP_DIR}/service" <<EOF
 [Unit]
 Description=sekai Fboard Node
 Documentation=https://github.com/Fearless743/sekai
@@ -286,6 +418,36 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+    else
+        cat >"${TMP_DIR}/service" <<EOF
+#!/sbin/openrc-run
+
+description="sekai Fboard Node"
+command="${BINARY_PATH}"
+command_args="-c ${CONFIG_FILE}"
+command_background=true
+pidfile="/run/${APP_NAME}.pid"
+output_log="/var/log/${APP_NAME}.log"
+error_log="/var/log/${APP_NAME}.log"
+# Graceful shutdown: allow 10s for connection drain before SIGKILL.
+retry="TERM/10/KILL/5"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ -f ${CREDENTIALS_FILE} ]; then
+        set -a
+        . ${CREDENTIALS_FILE}
+        set +a
+    fi
+    mkdir -p ${DATA_DIR}
+    touch "/var/log/${APP_NAME}.log"
+}
+EOF
+    fi
 }
 
 backup_existing() {
@@ -301,16 +463,15 @@ install_files() {
     install -m 755 "${TMP_DIR}/${APP_NAME}" "$BINARY_PATH"
     install -m 600 "${TMP_DIR}/config.yml" "$CONFIG_FILE"
     install -m 600 "${TMP_DIR}/credentials.env" "$CREDENTIALS_FILE"
-    install -m 644 "${TMP_DIR}/service" "$SERVICE_PATH"
-    systemctl daemon-reload
+    install -m "$(service_mode)" "${TMP_DIR}/service" "$SERVICE_PATH"
+    daemon_reload
 }
 
 wait_for_health() {
     if [ "$HEALTH_PORT" = "0" ]; then return 0; fi
     local i=0
     while [ "$i" -lt 30 ]; do
-        if systemctl is-active --quiet "$SERVICE_NAME" && \
-           curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+        if service_is_active && http_ok "http://127.0.0.1:${HEALTH_PORT}/healthz"; then
             return 0
         fi
         sleep 1; i=$((i + 1))
@@ -319,17 +480,17 @@ wait_for_health() {
 }
 
 start_service() {
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE_NAME"
+    service_enable
+    service_restart
     if ! wait_for_health; then
         log_error "服务健康检查失败"
-        journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager || true
+        show_logs
         return 1
     fi
 }
 
 perform_install() {
-    check_root; check_systemd; validate_install; detect_asset
+    check_root; detect_init; validate_install; detect_asset
     TMP_DIR="$(mktemp -d)"; BACKUP_DIR="${TMP_DIR}/backup"
     ensure_dirs
     stage_binary
@@ -339,7 +500,7 @@ perform_install() {
     install_files
     start_service
     log_info "安装完成"
-    log_info "服务: systemctl status ${SERVICE_NAME}"
+    log_info "服务: ${SERVICE_NAME}（${INIT}）"
     log_info "配置: ${CONFIG_FILE}（权限 600）"
     log_info "凭证: ${CREDENTIALS_FILE}（权限 600）"
     if [ "$HEALTH_PORT" != "0" ]; then
@@ -351,7 +512,7 @@ perform_install() {
 }
 
 perform_upgrade() {
-    check_root; check_systemd; detect_asset
+    check_root; detect_init; detect_asset
     [ -f "$CONFIG_FILE" ] || { log_error "未找到现有配置，请先执行 install"; exit 1; }
     TMP_DIR="$(mktemp -d)"; BACKUP_DIR="${TMP_DIR}/backup"
     ensure_dirs
@@ -364,13 +525,14 @@ perform_upgrade() {
 }
 
 perform_uninstall() {
-    check_root; check_systemd
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    check_root; detect_init
+    service_stop
+    service_disable
     rm -f "$SERVICE_PATH" "$BINARY_PATH"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    daemon_reload || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
+        rm -f "/var/log/${APP_NAME}.log"
         log_info "已卸载（含配置目录 ${INSTALL_ROOT}）"
     else
         log_info "已卸载（配置保留在 ${INSTALL_ROOT}）"
@@ -385,11 +547,8 @@ perform_status() {
         log_warn "未安装二进制"
     fi
     if [ -f "$CONFIG_FILE" ]; then log_info "配置: ${CONFIG_FILE}"; else log_warn "未找到配置"; fi
-    if systemctl list-unit-files "${SERVICE_NAME}.service" >/dev/null 2>&1; then
-        systemctl status "${SERVICE_NAME}.service" --no-pager || true
-    else
-        log_warn "未找到服务单元"
-    fi
+    detect_init
+    service_status
 }
 
 main() {
