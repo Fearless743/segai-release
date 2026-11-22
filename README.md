@@ -2,7 +2,7 @@
 
 **sekai** 是一个低占用、独立的 Fboard 节点实现。本仓库只发布编译好的二进制，**源码在私有仓库** [`Fearless743/sekai`](https://github.com/Fearless743/sekai)。
 
-单文件 Rust 二进制，不内嵌 xray-core；以 machine 模式通过 WebSocket 对接 Fboard 面板，核心协议为 VLESS，支持 TCP / TLS / WebSocket / httpupgrade / gRPC / XHTTP / QUIC / KCP / REALITY 等传输。
+单文件 Rust 二进制，不内嵌 xray-core；默认以 machine 模式通过 WebSocket 对接 Fboard 面板，也支持 xboard / xiao-v2board / v2board / ppanel / SSPanel-UIM / Metron 的 REST 适配。核心协议为 VLESS，支持 TCP / TLS / WebSocket / httpupgrade / gRPC / XHTTP / QUIC / KCP / REALITY 等传输。
 
 ## 一键安装
 
@@ -28,17 +28,29 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 --version v0.1.0              # 指定版本（默认 latest）
 ```
 
-多面板：重复 `--panel` / `--token` / `--machine-id` 三组参数即可（数量必须一一对应，license 只需一份）。脚本会生成 `instances:` 配置，每个面板一个实例，token 分别存入 `/etc/sekai/credentials.env` 的 `SEKAI_TOKEN_0`、`SEKAI_TOKEN_1`……单面板时仍保持原有扁平配置格式：
+多面板：重复 `--panel` / `--token` / `--machine-id` 三组参数即可（数量必须一一对应，license 只需一份）。脚本会生成 `instances:` 配置，每个面板一个实例，token 分别存入 `/etc/sekai/credentials.env` 的 `SEKAI_TOKEN_0`、`SEKAI_TOKEN_1`……单面板生成顶层 `panel:` 段。
+
+生成的 `config.yml` 使用三段式分组：`global`（日志/授权）、`panel`（地址/类型/machine/WS）、`node`（上报间隔/限流/证书）。旧版扁平格式仍可被二进制读取。
+
+每个面板可单独指定类型与凭据（按顺序与 `--panel` 对齐，省略项使用默认值）：
+
+```bash
+--panel-type fboard        # 默认：fboard；可选 xboard / xiao_v2board / v2board / ppanel / sspanel_uim / metron
+--node-id 5                # 单节点面板的节点 ID（省略则回退 machine-id）
+--node-type vless          # v2board 必填：vmess/vless/trojan/shadowsocks/hysteria
+--secret KEY               # ppanel secret_key / SSPanel Mu key（省略则回退 machine token）
+```
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/install.sh \
   | bash -s -- \
-    --panel https://a.example.com --token TOKEN_A --machine-id 52 \
+    --panel https://a.example.com --token TOKEN_A --machine-id 52 --panel-type fboard \
     --panel https://b.example.com --token TOKEN_B --machine-id 7 \
+    --panel-type v2board --node-id 5 --node-type vless \
     --license-key FBN-XXXX-XXXX
 ```
 
-日志默认关闭：生成的配置里 `log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。
+日志默认关闭：生成的配置里 `global.log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。
 
 其他操作：
 
