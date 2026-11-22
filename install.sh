@@ -553,6 +553,11 @@ perform_upgrade() {
     stage_binary
     render_service
     backup_existing
+    # install_files stages everything from TMP_DIR; an upgrade preserves the
+    # existing config/credentials instead of re-rendering them, so copy them
+    # into TMP_DIR before installing.
+    cp "$CONFIG_FILE" "${TMP_DIR}/config.yml"
+    [ -f "$CREDENTIALS_FILE" ] && cp "$CREDENTIALS_FILE" "${TMP_DIR}/credentials.env" || true
     install_files
     start_service
     log_info "升级完成"
