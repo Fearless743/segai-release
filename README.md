@@ -10,8 +10,10 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/install.sh \
-  | sudo bash -s -- --panel https://panel.example.com --token TOKEN --machine-id 1
+  | sudo bash -s -- --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXXXXXX-XXXXXXXX
 ```
+
+`--panel`、`--token`、`--machine-id`、`--license-key` 均为必填；缺少 license key 时安装脚本直接报错退出，不会生成可无授权运行的配置。
 
 安装结果：
 - 二进制：`/usr/local/bin/sekai`
@@ -23,7 +25,6 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 可选参数：
 
 ```bash
---license-key FBN-XXXX-XXXX   # 提供则写入配置并启用商业授权校验；不提供则不启用
 --version v0.1.0              # 指定版本（默认 latest）
 --health-port 65530           # 探活端口，0 关闭
 ```
