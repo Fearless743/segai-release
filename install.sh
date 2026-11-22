@@ -13,7 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
-SCRIPT_VERSION="20261123.1"
+SCRIPT_VERSION="20261123.2"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -378,6 +378,15 @@ validate_panels() {
             *"|$t|"*) ;;
             *) log_error "不支持的 panel.type: $t（允许: fboard/xboard/xiao_v2board/v2board/ppanel/sspanel_uim/metron）"; exit 1 ;;
         esac
+        case "$t" in
+            fboard|xboard|reference|default) ;;
+            *)
+                if [ -z "$(arr_value NODE_IDS "$i" "")" ]; then
+                    log_error "panel.type=$t 需要 --node-id（第 $((i+1)) 个面板）"
+                    exit 1
+                fi
+                ;;
+        esac
         case "${MACHINE_IDS[$i]}" in
             ''|*[!0-9]*) log_error "machine-id 必须是正整数: ${MACHINE_IDS[$i]}"; exit 1 ;;
         esac
@@ -416,16 +425,14 @@ stage_binary() {
 # indent 为字段缩进（单面板 "  " / 多面板 "      "）。
 panel_yaml() {
     local first="$1" indent="$2" idx="$3" token_env="$4"
-    local ptype nid ntype sec
+    local ptype ntype sec
     ptype=$(arr_value PANEL_TYPES "$idx" fboard)
-    nid=$(arr_value NODE_IDS "$idx" "")
     ntype=$(arr_value NODE_TYPES "$idx" "")
     sec=$(arr_value SECRETS "$idx" "")
 
     printf '%s' "${first}panel:"
     printf '\n%stype: %s' "$indent" "$ptype"
     printf '\n%surl: %s' "$indent" "$(yaml_quote "${PANEL_URLS[$idx]}")"
-    if [ -n "$nid" ]; then printf '\n%snode_id: %s' "$indent" "$nid"; fi
     if [ -n "$ntype" ]; then printf '\n%snode_type: %s' "$indent" "$(yaml_quote "$ntype")"; fi
     if [ -n "$sec" ]; then printf '\n%ssecret: %s' "$indent" "$(yaml_quote "$sec")"; fi
     printf '\n%smachine:' "$indent"
@@ -469,11 +476,22 @@ render_config() {
             echo "instances:"
             for ((i = 0; i < n; i++)); do
                 panel_yaml "  - " "      " "$i" "SEKAI_TOKEN_${i}"
+                # node_id 属于节点身份，放在同级的 node 段。
+                local nid
+                nid=$(arr_value NODE_IDS "$i" "")
+                if [ -n "$nid" ]; then
+                    printf '    node:\n      node_id: %s\n' "$nid"
+                fi
             done
         fi
 
         echo
         echo "node:"
+        if [ "$n" -eq 1 ]; then
+            echo "  node_id: $(arr_value NODE_IDS 0 0)"
+        else
+            echo "  node_id: 0"
+        fi
         echo "  report_interval: 60"
         echo "  pull_interval: 60"
         echo "  limits:"
