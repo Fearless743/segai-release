@@ -28,9 +28,9 @@ DEFAULT_VERSION="latest"
 DEFAULT_LOG_LEVEL="silent"
 
 ACTION="install"
-PANEL_URL=""
-TOKEN=""
-MACHINE_ID=""
+PANEL_URLS=()
+TOKENS=()
+MACHINE_IDS=()
 LICENSE_KEY=""
 RELEASE_VERSION="$DEFAULT_VERSION"
 LOG_LEVEL="$DEFAULT_LOG_LEVEL"
@@ -61,9 +61,9 @@ usage() {
     help         显示帮助
 
   REQUIRED (install):
-    --panel, -a       面板地址，如 https://panel.example.com
-    --token, -t       面板 machine token
-    --machine-id      面板 machine ID（正整数）
+    --panel, -a       面板地址，如 https://panel.example.com（可重复，每个面板一组）
+    --token, -t       面板 machine token（与 --panel 一一对应，可重复）
+    --machine-id      面板 machine ID（正整数，与 --panel 一一对应，可重复）
     --license-key     License Key（必填；写入配置并启用商业授权校验）
 
   OPTIONAL:
@@ -77,6 +77,9 @@ usage() {
   EXAMPLES:
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXX-XXXX
+    # 多面板：重复三组参数，共用一个进程与 license
+    sudo bash install.sh --panel https://a.example.com --token TOKEN_A --machine-id 1 \
+      --panel https://b.example.com --token TOKEN_B --machine-id 2 --license-key FBN-XXXX-XXXX
     sudo bash install.sh upgrade
     sudo bash install.sh uninstall --purge --yes
 HELP
@@ -126,9 +129,9 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             install|upgrade|uninstall|status|logs|help) ACTION="$1"; shift ;;
-            --panel|-a|--api)      PANEL_URL="${2:-}"; shift 2 ;;
-            --token|-t)            TOKEN="${2:-}"; shift 2 ;;
-            --machine-id)          MACHINE_ID="${2:-}"; shift 2 ;;
+            --panel|-a|--api)      PANEL_URLS+=("${2:-}"); shift 2 ;;
+            --token|-t)            TOKENS+=("${2:-}"); shift 2 ;;
+            --machine-id)          MACHINE_IDS+=("${2:-}"); shift 2 ;;
             --license-key)         LICENSE_KEY="${2:-}"; shift 2 ;;
             --version)             RELEASE_VERSION="${2:-}"; shift 2 ;;
             --purge)               PURGE=1; shift ;;
@@ -296,17 +299,23 @@ detect_asset() {
 }
 
 validate_install() {
-    [ -n "$PANEL_URL" ] || { log_error "缺少 --panel"; exit 1; }
-    [ -n "$TOKEN" ] || { log_error "缺少 --token"; exit 1; }
+    local n=${#PANEL_URLS[@]} i url id
+    [ "$n" -gt 0 ] || { log_error "缺少 --panel"; exit 1; }
+    [ "${#TOKENS[@]}" -eq "$n" ] || { log_error "--token 数量必须与 --panel 一致（${n} 个面板，${#TOKENS[@]} 个 token）"; exit 1; }
+    [ "${#MACHINE_IDS[@]}" -eq "$n" ] || { log_error "--machine-id 数量必须与 --panel 一致（${n} 个面板，${#MACHINE_IDS[@]} 个 ID）"; exit 1; }
     [ -n "$LICENSE_KEY" ] || { log_error "缺少 --license-key（未授权的节点无法运行）"; exit 1; }
-    case "$MACHINE_ID" in
-        ''|*[!0-9]*) log_error "--machine-id 必须是正整数"; exit 1 ;;
-    esac
-    [ "$MACHINE_ID" -gt 0 ] || { log_error "--machine-id 必须是正整数"; exit 1; }
-    case "$PANEL_URL" in
-        http://*|https://*) ;;
-        *) PANEL_URL="https://${PANEL_URL}" ;;
-    esac
+    for ((i = 0; i < n; i++)); do
+        url="${PANEL_URLS[$i]}"
+        case "$url" in
+            http://*|https://*) ;;
+            *) PANEL_URLS[$i]="https://${url}" ;;
+        esac
+        id="${MACHINE_IDS[$i]}"
+        case "$id" in
+            ''|*[!0-9]*) log_error "--machine-id[$i] 必须是正整数"; exit 1 ;;
+        esac
+        [ "$id" -gt 0 ] || { log_error "--machine-id[$i] 必须是正整数"; exit 1; }
+    done
 }
 
 yaml_quote() {
@@ -345,8 +354,7 @@ stage_binary() {
 }
 
 render_config() {
-    local panel_yaml license_block=""
-    panel_yaml="$(yaml_quote "$PANEL_URL")"
+    local license_block=""
     if [ -n "$LICENSE_KEY" ]; then
         license_block=$(cat <<EOF
 
@@ -360,15 +368,38 @@ license:
 EOF
         )
     fi
-    cat >"${TMP_DIR}/config.yml" <<EOF
-# ${APP_NAME} configuration — managed by install.sh (machine mode)
+
+    local n=${#PANEL_URLS[@]} i panels_block=""
+    if [ "$n" -eq 1 ]; then
+        # Single panel: keep the original flat layout.
+        panels_block=$(cat <<EOF
 panel:
-  url: ${panel_yaml}
+  url: $(yaml_quote "${PANEL_URLS[0]}")
 
 machine:
-  machine_id: ${MACHINE_ID}
+  machine_id: ${MACHINE_IDS[0]}
   token: ""                 # token 读取自 credentials.env 的 MACHINE_TOKEN
   token_env: MACHINE_TOKEN
+EOF
+        )
+    else
+        # Multi-panel: one process, one instance per panel/machine pair.
+        panels_block="instances:"
+        for ((i = 0; i < n; i++)); do
+            panels_block+="
+  - panel:
+      url: $(yaml_quote "${PANEL_URLS[$i]}")
+    machine:
+      machine_id: ${MACHINE_IDS[$i]}
+      token: \"\"
+      token_env: SEKAI_TOKEN_${i}
+"
+        done
+    fi
+
+    cat >"${TMP_DIR}/config.yml" <<EOF
+# ${APP_NAME} configuration — managed by install.sh (machine mode)
+${panels_block}
 
 log:
   # 默认 silent（完全不输出日志）；需要日志时请手动修改本文件为 info/debug/warn/error
@@ -392,7 +423,14 @@ cert:
   dir: "${DATA_DIR}/certs"
 ${license_block}
 EOF
-    printf 'MACHINE_TOKEN=%s\n' "$(env_quote "$TOKEN")" >"${TMP_DIR}/credentials.env"
+    if [ "$n" -eq 1 ]; then
+        printf 'MACHINE_TOKEN=%s\n' "$(env_quote "${TOKENS[0]}")" >"${TMP_DIR}/credentials.env"
+    else
+        : >"${TMP_DIR}/credentials.env"
+        for ((i = 0; i < n; i++)); do
+            printf 'SEKAI_TOKEN_%d=%s\n' "$i" "$(env_quote "${TOKENS[$i]}")" >>"${TMP_DIR}/credentials.env"
+        done
+    fi
     chmod 600 "${TMP_DIR}/credentials.env"
 }
 

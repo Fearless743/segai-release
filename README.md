@@ -28,6 +28,16 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 --version v0.1.0              # 指定版本（默认 latest）
 ```
 
+多面板：重复 `--panel` / `--token` / `--machine-id` 三组参数即可（数量必须一一对应，license 只需一份）。脚本会生成 `instances:` 配置，每个面板一个实例，token 分别存入 `/etc/sekai/credentials.env` 的 `SEKAI_TOKEN_0`、`SEKAI_TOKEN_1`……单面板时仍保持原有扁平配置格式：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/install.sh \
+  | bash -s -- \
+    --panel https://a.example.com --token TOKEN_A --machine-id 52 \
+    --panel https://b.example.com --token TOKEN_B --machine-id 7 \
+    --license-key FBN-XXXX-XXXX
+```
+
 日志默认关闭：生成的配置里 `log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。
 
 其他操作：
