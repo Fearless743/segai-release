@@ -26,16 +26,20 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 --license-key FBN-XXXX-XXXX   # 提供则写入配置并启用商业授权校验；不提供则不启用
 --version v0.1.0              # 指定版本（默认 latest）
 --health-port 65530           # 探活端口，0 关闭
---log-level info              # 日志级别
 ```
+
+日志默认关闭：生成的配置里 `log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。
 
 其他操作：
 
 ```bash
 sudo bash install.sh upgrade                       # 升级二进制并重启
 sudo bash install.sh status                        # 查看状态
+sudo bash install.sh logs                          # 实时跟随日志（Ctrl+C 退出）
 sudo bash install.sh uninstall --purge --yes       # 卸载（--purge 同时删除 /etc/sekai）
 ```
+
+`logs` 在 systemd 下用 `journalctl -u sekai.service -f`，在 Alpine/OpenRC 下跟随 `/var/log/sekai.log` 与 `/var/log/sekai.err.log`。日志内容为静默时为空属正常现象。
 
 支持平台：Linux x86_64 / aarch64，glibc（systemd）与 Alpine/musl（OpenRC）均自动识别并选用对应安装包。macOS 请用下方手动下载。
 
