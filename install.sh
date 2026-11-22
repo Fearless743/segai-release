@@ -583,6 +583,7 @@ main() {
         upgrade)   perform_upgrade   ;;
         uninstall) perform_uninstall ;;
         status)    perform_status    ;;
+        logs)      perform_logs      ;;
         help)      usage             ;;
         *) log_error "未知操作: $ACTION"; usage; exit 1 ;;
     esac
