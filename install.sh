@@ -66,9 +66,9 @@ usage() {
     --panel, -a       面板地址，如 https://panel.example.com
     --token, -t       面板 machine token
     --machine-id      面板 machine ID（正整数）
+    --license-key     License Key（必填；写入配置并启用商业授权校验）
 
   OPTIONAL:
-    --license-key     License Key（可选；提供则启用商业授权校验）
     --version         版本号或 latest（默认 latest）
     --health-port     本地探活端口（默认 65530，0 关闭）
     --purge           uninstall 时删除 /etc/sekai
@@ -302,6 +302,7 @@ detect_asset() {
 validate_install() {
     [ -n "$PANEL_URL" ] || { log_error "缺少 --panel"; exit 1; }
     [ -n "$TOKEN" ] || { log_error "缺少 --token"; exit 1; }
+    [ -n "$LICENSE_KEY" ] || { log_error "缺少 --license-key（未授权的节点无法运行）"; exit 1; }
     case "$MACHINE_ID" in
         ''|*[!0-9]*) log_error "--machine-id 必须是正整数"; exit 1 ;;
     esac
@@ -515,9 +516,7 @@ perform_install() {
     if [ "$HEALTH_PORT" != "0" ]; then
         log_info "健康检查: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
-    if [ -z "$LICENSE_KEY" ]; then
-        log_warn "未提供 --license-key，配置中未启用商业授权校验"
-    fi
+    log_info "授权: 已写入 license.key 并启用在线校验"
 }
 
 perform_upgrade() {
