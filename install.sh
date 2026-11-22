@@ -13,6 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
+SCRIPT_VERSION="20261122.5"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -620,6 +621,7 @@ perform_status() {
 }
 
 main() {
+    log_info "安装脚本版本: ${SCRIPT_VERSION}"
     parse_args "$@"
     case "$ACTION" in
         install)   perform_install   ;;
