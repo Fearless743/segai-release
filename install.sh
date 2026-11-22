@@ -13,7 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
-SCRIPT_VERSION="20261122.5"
+SCRIPT_VERSION="20261123.1"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -32,6 +32,10 @@ ACTION="install"
 PANEL_URLS=()
 TOKENS=()
 MACHINE_IDS=()
+PANEL_TYPES=()
+NODE_IDS=()
+NODE_TYPES=()
+SECRETS=()
 LICENSE_KEY=""
 RELEASE_VERSION="$DEFAULT_VERSION"
 LOG_LEVEL="$DEFAULT_LOG_LEVEL"
@@ -67,20 +71,31 @@ usage() {
     --machine-id      面板 machine ID（正整数，与 --panel 一一对应，可重复）
     --license-key     License Key（必填；写入配置并启用商业授权校验）
 
-  OPTIONAL:
+  OPTIONAL (每个面板可按需重复，按顺序与 --panel 对齐):
+    --panel-type      panel.type，默认 fboard。可选：
+                        fboard / xboard / xiao_v2board / v2board /
+                        ppanel / sspanel_uim / metron
+    --node-id         单节点面板的节点 ID（省略则回退 machine-id）
+    --node-type       v2board 的 node_type（vmess/vless/trojan/shadowsocks/hysteria）
+    --secret          ppanel secret_key / SSPanel Mu key（省略则回退 machine token）
     --version         版本号或 latest（默认 latest）
     --purge           uninstall 时删除 /etc/sekai
     --yes, -y         非交互确认
     --help, -h        显示帮助
 
   支持：glibc（systemd）、Alpine/musl（OpenRC）。Alpine 需先安装 bash。
+  生成的 config.yml 使用 global / panel / node 三段式分组。
 
   EXAMPLES:
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
-    sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXX-XXXX
+    # v2board 单节点面板
+    sudo bash install.sh --panel https://v2.example.com --token TOKEN --machine-id 1 \
+      --panel-type v2board --node-id 5 --node-type vless
     # 多面板：重复三组参数，共用一个进程与 license
     sudo bash install.sh --panel https://a.example.com --token TOKEN_A --machine-id 1 \
-      --panel https://b.example.com --token TOKEN_B --machine-id 2 --license-key FBN-XXXX-XXXX
+      --panel-type fboard \
+      --panel https://b.example.com --token TOKEN_B --machine-id 2 \
+      --panel-type sspanel_uim --secret MU_KEY --license-key FBN-XXXX-XXXX
     sudo bash install.sh upgrade
     sudo bash install.sh uninstall --purge --yes
 HELP
@@ -133,6 +148,10 @@ parse_args() {
             --panel|-a|--api)      PANEL_URLS+=("${2:-}"); shift 2 ;;
             --token|-t)            TOKENS+=("${2:-}"); shift 2 ;;
             --machine-id)          MACHINE_IDS+=("${2:-}"); shift 2 ;;
+            --panel-type|--type)   PANEL_TYPES+=("${2:-}"); shift 2 ;;
+            --node-id)             NODE_IDS+=("${2:-}"); shift 2 ;;
+            --node-type)           NODE_TYPES+=("${2:-}"); shift 2 ;;
+            --secret)              SECRETS+=("${2:-}"); shift 2 ;;
             --license-key)         LICENSE_KEY="${2:-}"; shift 2 ;;
             --version)             RELEASE_VERSION="${2:-}"; shift 2 ;;
             --purge)               PURGE=1; shift ;;
@@ -333,6 +352,45 @@ env_quote() {
     printf '"%s"' "$s"
 }
 
+# 按索引读取可选数组；缺失或空值返回默认值。
+arr_value() {
+    local name="$1" idx="$2" fallback="${3:-}"
+    local ref="${name}[$idx]"
+    local value="${!ref-}"
+    if [ -z "$value" ]; then printf '%s' "$fallback"; else printf '%s' "$value"; fi
+}
+
+PANEL_TYPE_CHOICES="fboard|xboard|xiao_v2board|xiao-v2board|v2board|ppanel|sspanel_uim|sspanel-uim|metron|reference|default"
+
+validate_panels() {
+    local n=${#PANEL_URLS[@]} i t
+    if [ "$n" -eq 0 ]; then
+        log_error "install 至少需要一组 --panel/--token/--machine-id"
+        exit 1
+    fi
+    if [ "${#TOKENS[@]}" -ne "$n" ] || [ "${#MACHINE_IDS[@]}" -ne "$n" ]; then
+        log_error "--panel / --token / --machine-id 的数量必须一致"
+        exit 1
+    fi
+    for ((i = 0; i < n; i++)); do
+        t=$(arr_value PANEL_TYPES "$i" fboard)
+        case "|$PANEL_TYPE_CHOICES|" in
+            *"|$t|"*) ;;
+            *) log_error "不支持的 panel.type: $t（允许: fboard/xboard/xiao_v2board/v2board/ppanel/sspanel_uim/metron）"; exit 1 ;;
+        esac
+        case "${MACHINE_IDS[$i]}" in
+            ''|*[!0-9]*) log_error "machine-id 必须是正整数: ${MACHINE_IDS[$i]}"; exit 1 ;;
+        esac
+        local nid
+        nid=$(arr_value NODE_IDS "$i" "")
+        if [ -n "$nid" ]; then
+            case "$nid" in
+                ''|*[!0-9]*) log_error "node-id 必须是正整数: $nid"; exit 1 ;;
+            esac
+        fi
+    done
+}
+
 ensure_dirs() {
     mkdir -p "$INSTALL_ROOT" "$DATA_DIR" "$TMP_DIR"
     chmod 700 "$INSTALL_ROOT"
@@ -354,76 +412,77 @@ stage_binary() {
     chmod 755 "${TMP_DIR}/${APP_NAME}"
 }
 
+# 渲染一个 panel 段。first 为首行前缀（单面板 "" / 多面板 "  - "），
+# indent 为字段缩进（单面板 "  " / 多面板 "      "）。
+panel_yaml() {
+    local first="$1" indent="$2" idx="$3" token_env="$4"
+    local ptype nid ntype sec
+    ptype=$(arr_value PANEL_TYPES "$idx" fboard)
+    nid=$(arr_value NODE_IDS "$idx" "")
+    ntype=$(arr_value NODE_TYPES "$idx" "")
+    sec=$(arr_value SECRETS "$idx" "")
+
+    printf '%s' "${first}panel:"
+    printf '\n%stype: %s' "$indent" "$ptype"
+    printf '\n%surl: %s' "$indent" "$(yaml_quote "${PANEL_URLS[$idx]}")"
+    if [ -n "$nid" ]; then printf '\n%snode_id: %s' "$indent" "$nid"; fi
+    if [ -n "$ntype" ]; then printf '\n%snode_type: %s' "$indent" "$(yaml_quote "$ntype")"; fi
+    if [ -n "$sec" ]; then printf '\n%ssecret: %s' "$indent" "$(yaml_quote "$sec")"; fi
+    printf '\n%smachine:' "$indent"
+    printf '\n%s  machine_id: %s' "$indent" "${MACHINE_IDS[$idx]}"
+    printf '\n%s  token: ""' "$indent"
+    printf '\n%s  token_env: %s' "$indent" "$token_env"
+    printf '\n%sws:' "$indent"
+    printf '\n%s  url: ""' "$indent"
+    printf '\n%s  status_interval: 10' "$indent"
+    printf '\n%s  handshake_timeout: 15' "$indent"
+    printf '\n%s  backoff_initial: 1' "$indent"
+    printf '\n%s  backoff_max: 60' "$indent"
+    printf '\n'
+}
+
 render_config() {
-    local license_block=""
-    if [ -n "$LICENSE_KEY" ]; then
-        license_block=$(cat <<EOF
+    local n=${#PANEL_URLS[@]} i
 
-license:
-  enabled: true
-  key: $(yaml_quote "$LICENSE_KEY")
-  cache_path: "${DATA_DIR}/license.cache"
-  grace_hours: 72
-  renew_hours: 24
-  timeout_secs: 15
-EOF
-        )
-    fi
+    {
+        echo "# ${APP_NAME} configuration — managed by install.sh"
+        echo "# 分组: global(进程级) / panel(面板对接) / node(节点运行)"
+        echo
+        echo "global:"
+        echo "  log:"
+        echo "    # 默认 silent；需要日志时改为 info/debug/warn/error"
+        echo "    level: $(yaml_quote "$LOG_LEVEL")"
+        if [ -n "$LICENSE_KEY" ]; then
+            echo "  license:"
+            echo "    enabled: true"
+            echo "    key: $(yaml_quote "$LICENSE_KEY")"
+            echo "    cache_path: \"${DATA_DIR}/license.cache\""
+            echo "    grace_hours: 72"
+            echo "    renew_hours: 24"
+            echo "    timeout_secs: 15"
+        fi
 
-    local n=${#PANEL_URLS[@]} i panels_block=""
-    if [ "$n" -eq 1 ]; then
-        # Single panel: keep the original flat layout.
-        panels_block=$(cat <<EOF
-panel:
-  url: $(yaml_quote "${PANEL_URLS[0]}")
+        echo
+        if [ "$n" -eq 1 ]; then
+            panel_yaml "" "  " 0 MACHINE_TOKEN
+        else
+            echo "instances:"
+            for ((i = 0; i < n; i++)); do
+                panel_yaml "  - " "      " "$i" "SEKAI_TOKEN_${i}"
+            done
+        fi
 
-machine:
-  machine_id: ${MACHINE_IDS[0]}
-  token: ""                 # token 读取自 credentials.env 的 MACHINE_TOKEN
-  token_env: MACHINE_TOKEN
-EOF
-        )
-    else
-        # Multi-panel: one process, one instance per panel/machine pair.
-        panels_block="instances:"
-        for ((i = 0; i < n; i++)); do
-            panels_block+="
-  - panel:
-      url: $(yaml_quote "${PANEL_URLS[$i]}")
-    machine:
-      machine_id: ${MACHINE_IDS[$i]}
-      token: \"\"
-      token_env: SEKAI_TOKEN_${i}
-"
-        done
-    fi
+        echo
+        echo "node:"
+        echo "  report_interval: 60"
+        echo "  pull_interval: 60"
+        echo "  limits:"
+        echo "    device_limit: true"
+        echo "    speed_limit: true"
+        echo "  cert:"
+        echo "    dir: \"${DATA_DIR}/certs\""
+    } >"${TMP_DIR}/config.yml"
 
-    cat >"${TMP_DIR}/config.yml" <<EOF
-# ${APP_NAME} configuration — managed by install.sh (machine mode)
-${panels_block}
-
-log:
-  # 默认 silent（完全不输出日志）；需要日志时请手动修改本文件为 info/debug/warn/error
-  level: $(yaml_quote "$LOG_LEVEL")
-
-ws:
-  url: ""
-  status_interval: 10
-  handshake_timeout: 15
-  backoff_initial: 1
-  backoff_max: 60
-
-node:
-  report_interval: 60
-
-limits:
-  device_limit: true
-  speed_limit: true
-
-cert:
-  dir: "${DATA_DIR}/certs"
-${license_block}
-EOF
     if [ "$n" -eq 1 ]; then
         printf 'MACHINE_TOKEN=%s\n' "$(env_quote "${TOKENS[0]}")" >"${TMP_DIR}/credentials.env"
     else
@@ -530,7 +589,7 @@ start_service() {
 }
 
 perform_install() {
-    check_root; detect_init; validate_install; detect_asset
+    check_root; detect_init; validate_install; validate_panels; detect_asset
     TMP_DIR="$(mktemp -d)"; BACKUP_DIR="${TMP_DIR}/backup"
     ensure_dirs
     stage_binary
