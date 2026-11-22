@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 
 ```bash
 --panel-type fboard        # 默认：fboard；可选 xboard / xiao_v2board / v2board / ppanel / sspanel_uim / metron
---node-id 5                # 单节点面板的节点 ID（省略则回退 machine-id）
+--node-id 5                # 单节点面板必填，写入 node.node_id（fboard/xboard 可省略）
 --node-type vless          # v2board 必填：vmess/vless/trojan/shadowsocks/hysteria
 --secret KEY               # ppanel secret_key / SSPanel Mu key（省略则回退 machine token）
 ```
