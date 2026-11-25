@@ -15,6 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 
 `--panel`、`--token`、`--machine-id` 必填。`--license-key` 首次安装必填；若本地已有 license 缓存（`/etc/sekai/data/license.cache`）或旧配置中已有 `license.key`，重装/调整配置时可省略，脚本会复用本地授权而不是生成无授权配置；本地也没有任何授权信息时脚本直接报错退出。
 
+已安装后再执行 `install` 会把本次传入的面板**追加**到现有配置，不会覆盖已有面板；相同 `面板地址 + machine ID` 重复传入时只更新其 token，不会产生重复实例。配置中的其他自定义设置与凭证也会保留。
+
 安装结果：
 - 二进制：`/usr/local/bin/sekai`
 - 配置：`/etc/sekai/config.yml`（权限 600）
@@ -26,6 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
 
 ```bash
 --version v0.1.0              # 指定版本（默认 latest）
+--replace                     # install 时重建配置，覆盖现有面板（默认追加）
 ```
 
 多面板：重复 `--panel` / `--token` / `--machine-id` 三组参数即可（数量必须一一对应，license 只需一份）。脚本会生成 `instances:` 配置，每个面板一个实例，token 分别存入 `/etc/sekai/credentials.env` 的 `SEKAI_TOKEN_0`、`SEKAI_TOKEN_1`……单面板时仍保持原有扁平配置格式：
@@ -37,6 +40,15 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
     --panel https://b.example.com --token TOKEN_B --machine-id 7 \
     --license-key FBN-XXXX-XXXX
 ```
+
+已安装一个面板后再添加第二个面板，直接重跑 install（只传新面板即可，无需重复 `--license-key`）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/install.sh \
+  | bash -s -- --panel https://c.example.com --token TOKEN_C --machine-id 8
+```
+
+如需彻底重建配置（丢弃旧面板及自定义项），加 `--replace`。
 
 日志默认关闭：生成的配置里 `log.level: silent`（完全不输出）。需要日志时请手动编辑 `/etc/sekai/config.yml`，把该值改为 `info` / `debug` / `warn` / `error` 或 `off`，然后重启服务。
 

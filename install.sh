@@ -13,7 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
-SCRIPT_VERSION="20261126.1"
+SCRIPT_VERSION="20261126.2"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -37,6 +37,7 @@ LICENSE_KEY_FROM_CONFIG=""
 RELEASE_VERSION="$DEFAULT_VERSION"
 LOG_LEVEL="$DEFAULT_LOG_LEVEL"
 PURGE=0
+REPLACE=0
 YES=0
 TMP_DIR=""
 BACKUP_DIR=""
@@ -70,6 +71,7 @@ usage() {
 
   OPTIONAL:
     --version         版本号或 latest（默认 latest）
+    --replace         install 时重建配置而非把新面板追加到现有配置
     --purge           uninstall 时删除 /etc/sekai
     --yes, -y         非交互确认
     --help, -h        显示帮助
@@ -83,6 +85,8 @@ usage() {
     # 多面板：重复三组参数，共用一个进程与 license
     sudo bash install.sh --panel https://a.example.com --token TOKEN_A --machine-id 1 \
       --panel https://b.example.com --token TOKEN_B --machine-id 2 --license-key FBN-XXXX-XXXX
+    # 已安装后再跑 install 会把新面板追加到现有配置；--replace 才会覆盖
+    sudo bash install.sh --panel https://c.example.com --token TOKEN_C --machine-id 3
     sudo bash install.sh upgrade
     sudo bash install.sh uninstall --purge --yes
 HELP
@@ -137,6 +141,7 @@ parse_args() {
             --machine-id)          MACHINE_IDS+=("${2:-}"); shift 2 ;;
             --license-key)         LICENSE_KEY="${2:-}"; shift 2 ;;
             --version)             RELEASE_VERSION="${2:-}"; shift 2 ;;
+            --replace)             REPLACE=1; shift ;;
             --purge)               PURGE=1; shift ;;
             --yes|-y)              YES=1; shift ;;
             --help|-h)             ACTION="help"; shift ;;
@@ -385,14 +390,13 @@ stage_binary() {
     chmod 755 "${TMP_DIR}/${APP_NAME}"
 }
 
-render_config() {
+render_license_block() {
     local license_key="$LICENSE_KEY"
     [ -n "$license_key" ] || license_key="$LICENSE_KEY_FROM_CONFIG"
-    local license_block=""
     # Keep the license block (and cache path) even when only a local cache is
     # present — the node must still find the saved entitlement after reinstall.
-    if [ -n "$license_key" ] || license_cache_exists; then
-        license_block=$(cat <<EOF
+    [ -n "$license_key" ] || license_cache_exists || return 0
+    cat <<EOF
 
 license:
   enabled: true
@@ -402,40 +406,51 @@ license:
   renew_hours: 24
   timeout_secs: 15
 EOF
-        )
-    fi
+}
 
-    local n=${#PANEL_URLS[@]} i panels_block=""
+# Fresh installs and panel merges share the same layout. These arrays are
+# populated by render_config / render_config_merge before rendering.
+RENDER_URLS=()
+RENDER_IDS=()
+RENDER_ENVS=()
+
+render_panels_block() {
+    local n=${#RENDER_URLS[@]} i
     if [ "$n" -eq 1 ]; then
-        # Single panel: keep the original flat layout.
-        panels_block=$(cat <<EOF
+        cat <<EOF
 panel:
-  url: $(yaml_quote "${PANEL_URLS[0]}")
+  url: $(yaml_quote "${RENDER_URLS[0]}")
 
 machine:
-  machine_id: ${MACHINE_IDS[0]}
-  token: ""                 # token 读取自 credentials.env 的 MACHINE_TOKEN
-  token_env: MACHINE_TOKEN
+  machine_id: ${RENDER_IDS[0]}
+  token: ""                 # token 读取自 credentials.env 的 ${RENDER_ENVS[0]}
+  token_env: ${RENDER_ENVS[0]}
 EOF
-        )
     else
-        # Multi-panel: one process, one instance per panel/machine pair.
-        panels_block="instances:"
+        printf 'instances:\n'
         for ((i = 0; i < n; i++)); do
-            panels_block+="
-  - panel:
-      url: $(yaml_quote "${PANEL_URLS[$i]}")
-    machine:
-      machine_id: ${MACHINE_IDS[$i]}
-      token: \"\"
-      token_env: SEKAI_TOKEN_${i}
-"
+            printf '  - panel:\n      url: %s\n    machine:\n      machine_id: %s\n      token: ""\n      token_env: %s\n' \
+                "$(yaml_quote "${RENDER_URLS[$i]}")" "${RENDER_IDS[$i]}" "${RENDER_ENVS[$i]}"
+        done
+    fi
+}
+
+render_config() {
+    local n=${#PANEL_URLS[@]} i
+    RENDER_URLS=("${PANEL_URLS[@]}")
+    RENDER_IDS=("${MACHINE_IDS[@]}")
+    RENDER_ENVS=()
+    if [ "$n" -eq 1 ]; then
+        RENDER_ENVS=(MACHINE_TOKEN)
+    else
+        for ((i = 0; i < n; i++)); do
+            RENDER_ENVS+=("SEKAI_TOKEN_${i}")
         done
     fi
 
     cat >"${TMP_DIR}/config.yml" <<EOF
 # ${APP_NAME} configuration — managed by install.sh (machine mode)
-${panels_block}
+$(render_panels_block)
 
 log:
   # 默认 silent（完全不输出日志）；需要日志时请手动修改本文件为 info/debug/warn/error
@@ -457,16 +472,179 @@ limits:
 
 cert:
   dir: "${DATA_DIR}/certs"
-${license_block}
+$(render_license_block)
 EOF
-    if [ "$n" -eq 1 ]; then
-        printf 'MACHINE_TOKEN=%s\n' "$(env_quote "${TOKENS[0]}")" >"${TMP_DIR}/credentials.env"
+    : >"${TMP_DIR}/credentials.env"
+    for ((i = 0; i < n; i++)); do
+        printf '%s=%s\n' "${RENDER_ENVS[$i]}" "$(env_quote "${TOKENS[$i]}")" >>"${TMP_DIR}/credentials.env"
+    done
+    chmod 600 "${TMP_DIR}/credentials.env"
+}
+
+# Read panel entries out of an existing config (flat or `instances:` layout).
+# Output is tab-separated: url, machine_id, token_env.
+load_existing_panels() {
+    local src="$1"
+    EXISTING_URLS=(); EXISTING_IDS=(); EXISTING_ENVS=()
+    local url id env
+    if grep -q '^instances:[[:space:]]*$' "$src"; then
+        while IFS=$'\t' read -r url id env; do
+            [ -n "$url" ] || continue
+            EXISTING_URLS+=("$url")
+            EXISTING_IDS+=("$id")
+            EXISTING_ENVS+=("${env:-MACHINE_TOKEN}")
+        done < <(awk '
+            function clean(s) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                sub(/^["'\'']/, "", s)
+                sub(/["'\'']$/, "", s)
+                return s
+            }
+            function flush() {
+                if (url != "" && id != "") printf "%s\t%s\t%s\n", url, id, env
+                url=""; id=""; env=""
+            }
+            /^instances:[[:space:]]*$/ { inside=1; next }
+            inside && /^[^[:space:]#]/ { flush(); inside=0 }
+            inside && /^[[:space:]]*-[[:space:]]*panel:/ { flush(); next }
+            inside && /^[[:space:]]*url:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*url:[[:space:]]*/, "", line); url=clean(line); next
+            }
+            inside && /^[[:space:]]*machine_id:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*machine_id:[[:space:]]*/, "", line); id=clean(line); next
+            }
+            inside && /^[[:space:]]*token_env:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*token_env:[[:space:]]*/, "", line); env=clean(line); next
+            }
+            END { flush() }
+        ' "$src")
     else
-        : >"${TMP_DIR}/credentials.env"
-        for ((i = 0; i < n; i++)); do
-            printf 'SEKAI_TOKEN_%d=%s\n' "$i" "$(env_quote "${TOKENS[$i]}")" >>"${TMP_DIR}/credentials.env"
+        while IFS=$'\t' read -r url id env; do
+            [ -n "$url" ] || continue
+            EXISTING_URLS+=("$url")
+            EXISTING_IDS+=("$id")
+            EXISTING_ENVS+=("${env:-MACHINE_TOKEN}")
+        done < <(awk '
+            function clean(s) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                sub(/^["'\'']/, "", s)
+                sub(/["'\'']$/, "", s)
+                return s
+            }
+            /^panel:[[:space:]]*$/ { in_panel=1; next }
+            in_panel && /^[^[:space:]#]/ { in_panel=0 }
+            in_panel && /^[[:space:]]*url:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*url:[[:space:]]*/, "", line); url=clean(line); next
+            }
+            /^machine:[[:space:]]*$/ { in_machine=1; next }
+            in_machine && /^[^[:space:]#]/ { in_machine=0 }
+            in_machine && /^[[:space:]]*machine_id:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*machine_id:[[:space:]]*/, "", line); id=clean(line); next
+            }
+            in_machine && /^[[:space:]]*token_env:[[:space:]]*/ {
+                line=$0; sub(/^[[:space:]]*token_env:[[:space:]]*/, "", line); env=clean(line); next
+            }
+            END { if (url != "" && id != "") printf "%s\t%s\t%s\n", url, id, env }
+        ' "$src")
+    fi
+}
+
+# Re-running install adds the requested panels to the existing config instead
+# of overwriting it. Existing non-panel settings and token values are kept.
+render_config_merge() {
+    local src_config="$CONFIG_FILE" src_cred="$CREDENTIALS_FILE"
+    [ -f "$BACKUP_DIR/config.yml" ] && src_config="$BACKUP_DIR/config.yml"
+    [ -f "$BACKUP_DIR/credentials.env" ] && src_cred="$BACKUP_DIR/credentials.env"
+
+    load_existing_panels "$src_config"
+
+    local -a merged_urls=() merged_ids=() merged_envs=() merged_tokens=() custom_cred=()
+    local -A cred_lines=()
+    local i j found env k line key
+
+    if [ -f "$src_cred" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ''|\#*) continue ;;
+                *=*)
+                    key="${line%%=*}"
+                    case "$key" in
+                        MACHINE_TOKEN|SEKAI_TOKEN_*) cred_lines["$key"]="$line" ;;
+                        *) custom_cred+=("$line") ;;
+                    esac
+                    ;;
+            esac
+        done < "$src_cred"
+    fi
+
+    for ((i = 0; i < ${#EXISTING_URLS[@]}; i++)); do
+        merged_urls+=("${EXISTING_URLS[$i]}")
+        merged_ids+=("${EXISTING_IDS[$i]}")
+        merged_envs+=("${EXISTING_ENVS[$i]}")
+        merged_tokens+=("")
+    done
+
+    for ((i = 0; i < ${#PANEL_URLS[@]}; i++)); do
+        found=-1
+        for ((j = 0; j < ${#merged_urls[@]}; j++)); do
+            if [ "${merged_urls[$j]}" = "${PANEL_URLS[$i]}" ] && [ "${merged_ids[$j]}" = "${MACHINE_IDS[$i]}" ]; then
+                found=$j
+                break
+            fi
+        done
+        if [ "$found" -ge 0 ]; then
+            merged_tokens[$found]="${TOKENS[$i]}"
+            log_info "面板已存在，更新 token: ${PANEL_URLS[$i]} (machine ${MACHINE_IDS[$i]})"
+            continue
+        fi
+        k=0
+        while :; do
+            env="SEKAI_TOKEN_${k}"
+            [ -n "${cred_lines[$env]-}" ] && { k=$((k + 1)); continue; }
+            for ((j = 0; j < ${#merged_envs[@]}; j++)); do
+                [ "${merged_envs[$j]}" = "$env" ] && break
+            done
+            [ "$j" -lt "${#merged_envs[@]}" ] && { k=$((k + 1)); continue; }
+            break
+        done
+        merged_urls+=("${PANEL_URLS[$i]}")
+        merged_ids+=("${MACHINE_IDS[$i]}")
+        merged_envs+=("$env")
+        merged_tokens+=("${TOKENS[$i]}")
+        log_info "追加面板: ${PANEL_URLS[$i]} (machine ${MACHINE_IDS[$i]})"
+    done
+
+    RENDER_URLS=("${merged_urls[@]}")
+    RENDER_IDS=("${merged_ids[@]}")
+    RENDER_ENVS=("${merged_envs[@]}")
+
+    # Everything except the managed panel/license blocks is preserved verbatim.
+    {
+        render_panels_block
+        printf '\n'
+        awk '
+            /^(panel|machine|instances|license):[[:space:]]*$/ { skip=1; next }
+            skip && /^[^[:space:]#]/ { skip=0 }
+            !skip { print }
+        ' "$src_config"
+        printf '\n'
+        render_license_block
+    } >"${TMP_DIR}/config.yml"
+
+    : >"${TMP_DIR}/credentials.env"
+    if [ ${#custom_cred[@]} -gt 0 ]; then
+        for line in "${custom_cred[@]}"; do
+            printf '%s\n' "$line" >>"${TMP_DIR}/credentials.env"
         done
     fi
+    for ((i = 0; i < ${#merged_envs[@]}; i++)); do
+        env="${merged_envs[$i]}"
+        if [ -n "${merged_tokens[$i]}" ]; then
+            printf '%s=%s\n' "$env" "$(env_quote "${merged_tokens[$i]}")" >>"${TMP_DIR}/credentials.env"
+        elif [ -n "${cred_lines[$env]-}" ]; then
+            printf '%s\n' "${cred_lines[$env]}" >>"${TMP_DIR}/credentials.env"
+        fi
+    done
     chmod 600 "${TMP_DIR}/credentials.env"
 }
 
@@ -569,9 +747,13 @@ perform_install() {
     TMP_DIR="$(mktemp -d)"; BACKUP_DIR="${TMP_DIR}/backup"
     ensure_dirs
     stage_binary
-    render_config
-    render_service
     backup_existing
+    if [ "$REPLACE" -eq 0 ] && [ -f "$BACKUP_DIR/config.yml" ]; then
+        render_config_merge
+    else
+        render_config
+    fi
+    render_service
     install_files
     start_service
     log_info "安装完成"
