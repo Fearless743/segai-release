@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/inst
   | sudo bash -s -- --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXXXXXX-XXXXXXXX
 ```
 
-`--panel`、`--token`、`--machine-id`、`--license-key` 均为必填；缺少 license key 时安装脚本直接报错退出，不会生成可无授权运行的配置。
+`--panel`、`--token`、`--machine-id` 必填。`--license-key` 首次安装必填；若本地已有 license 缓存（`/etc/sekai/data/license.cache`）或旧配置中已有 `license.key`，重装/调整配置时可省略，脚本会复用本地授权而不是生成无授权配置；本地也没有任何授权信息时脚本直接报错退出。
 
 安装结果：
 - 二进制：`/usr/local/bin/sekai`
@@ -99,6 +99,7 @@ chmod +x sekai
 
 - License 按服务器硬件指纹绑定：同一台服务器上的多个进程/面板只占 1 个设备额度
 - 令牌有效期由 Worker 签名内的 `exp` 决定，本地缓存不可篡改绕过
+- 本地已缓存有效令牌（或旧配置里保留了 key）时，安装脚本不再要求重复输入 license key；令牌到期后仍需凭 key 在线续期
 - 详细授权机制见源码仓库 [docs/LICENSING.md](https://github.com/Fearless743/sekai/blob/main/docs/LICENSING.md)
 
 购买与授权管理请联系项目方。

@@ -13,7 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
-SCRIPT_VERSION="20261122.5"
+SCRIPT_VERSION="20261126.1"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -33,6 +33,7 @@ PANEL_URLS=()
 TOKENS=()
 MACHINE_IDS=()
 LICENSE_KEY=""
+LICENSE_KEY_FROM_CONFIG=""
 RELEASE_VERSION="$DEFAULT_VERSION"
 LOG_LEVEL="$DEFAULT_LOG_LEVEL"
 PURGE=0
@@ -65,7 +66,7 @@ usage() {
     --panel, -a       面板地址，如 https://panel.example.com（可重复，每个面板一组）
     --token, -t       面板 machine token（与 --panel 一一对应，可重复）
     --machine-id      面板 machine ID（正整数，与 --panel 一一对应，可重复）
-    --license-key     License Key（必填；写入配置并启用商业授权校验）
+    --license-key     License Key（本地已有 license 缓存，或现有配置中已有 key 时可省略）
 
   OPTIONAL:
     --version         版本号或 latest（默认 latest）
@@ -76,6 +77,7 @@ usage() {
   支持：glibc（systemd）、Alpine/musl（OpenRC）。Alpine 需先安装 bash。
 
   EXAMPLES:
+    # 首次安装需传 --license-key；若本地已有 license 缓存或旧配置中的 key，可省略
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1
     sudo bash install.sh --panel https://panel.example.com --token TOKEN --machine-id 1 --license-key FBN-XXXX-XXXX
     # 多面板：重复三组参数，共用一个进程与 license
@@ -299,12 +301,41 @@ detect_asset() {
     log_info "平台: ${os}/${arch}，libc: ${LIBC}"
 }
 
+# Reuse the key from an existing config so a reinstall does not need
+# --license-key again; only the `license:` section is inspected.
+existing_license_key() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    awk '
+        /^license:[[:space:]]*$/ { in_license = 1; next }
+        /^[^[:space:]#]/        { in_license = 0 }
+        in_license && /^[[:space:]]*key:[[:space:]]*/ {
+            sub(/^[[:space:]]*key:[[:space:]]*/, "")
+            gsub(/["'\'']/, "")
+            print
+            exit
+        }
+    ' "$CONFIG_FILE"
+}
+
+license_cache_exists() {
+    [ -f "${DATA_DIR}/license.cache" ]
+}
+
 validate_install() {
     local n=${#PANEL_URLS[@]} i url id
     [ "$n" -gt 0 ] || { log_error "缺少 --panel"; exit 1; }
     [ "${#TOKENS[@]}" -eq "$n" ] || { log_error "--token 数量必须与 --panel 一致（${n} 个面板，${#TOKENS[@]} 个 token）"; exit 1; }
     [ "${#MACHINE_IDS[@]}" -eq "$n" ] || { log_error "--machine-id 数量必须与 --panel 一致（${n} 个面板，${#MACHINE_IDS[@]} 个 ID）"; exit 1; }
-    [ -n "$LICENSE_KEY" ] || { log_error "缺少 --license-key（未授权的节点无法运行）"; exit 1; }
+    if [ -z "$LICENSE_KEY" ]; then
+        LICENSE_KEY_FROM_CONFIG="$(existing_license_key)"
+        if [ -n "$LICENSE_KEY_FROM_CONFIG" ]; then
+            log_info "复用现有配置中的 license.key"
+        elif license_cache_exists; then
+            log_info "检测到本地已保存的 license 缓存，跳过 --license-key"
+        else
+            log_error "缺少 --license-key（未授权的节点无法运行）"; exit 1
+        fi
+    fi
     for ((i = 0; i < n; i++)); do
         url="${PANEL_URLS[$i]}"
         case "$url" in
@@ -355,13 +386,17 @@ stage_binary() {
 }
 
 render_config() {
+    local license_key="$LICENSE_KEY"
+    [ -n "$license_key" ] || license_key="$LICENSE_KEY_FROM_CONFIG"
     local license_block=""
-    if [ -n "$LICENSE_KEY" ]; then
+    # Keep the license block (and cache path) even when only a local cache is
+    # present — the node must still find the saved entitlement after reinstall.
+    if [ -n "$license_key" ] || license_cache_exists; then
         license_block=$(cat <<EOF
 
 license:
   enabled: true
-  key: $(yaml_quote "$LICENSE_KEY")
+  key: $(yaml_quote "$license_key")
   cache_path: "${DATA_DIR}/license.cache"
   grace_hours: 72
   renew_hours: 24
@@ -543,7 +578,13 @@ perform_install() {
     log_info "服务: ${SERVICE_NAME}（${INIT}）"
     log_info "配置: ${CONFIG_FILE}（权限 600）"
     log_info "凭证: ${CREDENTIALS_FILE}（权限 600）"
-    log_info "授权: 已写入 license.key 并启用在线校验"
+    if [ -n "$LICENSE_KEY" ]; then
+        log_info "授权: 已写入 license.key 并启用在线校验"
+    elif [ -n "$LICENSE_KEY_FROM_CONFIG" ]; then
+        log_info "授权: 复用现有 license.key 并启用在线校验"
+    else
+        log_info "授权: 使用本地已保存的 license 缓存（未提供 --license-key）"
+    fi
 }
 
 perform_upgrade() {
