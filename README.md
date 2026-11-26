@@ -65,6 +65,21 @@ sudo bash install.sh uninstall --purge --yes       # 卸载（--purge 同时删�
 
 支持平台：Linux x86_64 / aarch64，glibc（systemd）与 Alpine/musl（OpenRC）均自动识别并选用对应安装包。macOS 请用下方手动下载。
 
+## 从 fboard-node 迁移
+
+已有节点如果运行的是 fboard-node（Go 版，这里仅指待替换的外部节点程序），可用迁移脚本一键替换为 sekai 并沿用原配置：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/migrate-from-fboard-node.sh \
+  | sudo bash -s -- --license-key FBN-XXXXXXXX-XXXXXXXX
+```
+
+脚本先备份原目录到 `/etc/sekai/backups/`，把 `panel.url` / `machine_id` / `token_env` / `instances` / `push_interval→report_interval` 翻译成 `/etc/sekai/config.yml`，原样复制 `credentials.env`，安装 sekai 二进制与 `sekai.service`，卸载旧节点，校验配置后启动。
+
+- 不传 `--license-key`（或 `LICENSE_KEY` 环境变量）时只写入占位符且**不启动服务**；填好 `/etc/sekai/config.yml` 的 `license.key` 后执行 `sudo sekai start`。
+- `--dry-run` 预览；`--keep-old` 保留旧文件；`--no-start` 只安装不启动；`--binary PATH` 使用本地二进制。
+- 需要 `python3` + PyYAML（`apt install python3-yaml`）。
+
 ## 手动下载
 
 从 [Releases](../../releases) 页面下载对应平台的压缩包，或使用下面的直链（始终指向最新版本）：
