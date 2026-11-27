@@ -1,0 +1,24 @@
+name: Install script tests
+
+on:
+  push:
+    paths:
+      - install.sh
+      - tests/**
+      - .github/workflows/install-test.yml
+  pull_request:
+    paths:
+      - install.sh
+      - tests/**
+      - .github/workflows/install-test.yml
+
+jobs:
+  test:
+    name: bash syntax + asset selection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n install.sh
+      - name: Asset selection regression tests
+        run: bash tests/test-install-assets.sh
