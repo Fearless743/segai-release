@@ -78,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/Fearless743/sekai-release/main/migr
 
 - 不传 `--license-key`（或 `LICENSE_KEY` 环境变量）时只写入占位符且**不启动服务**；填好 `/etc/sekai/config.yml` 的 `license.key` 后执行 `sudo sekai start`。
 - `--dry-run` 预览；`--keep-old` 保留旧文件；`--no-start` 只安装不启动；`--binary PATH` 使用本地二进制。
-- 需要 `python3` + PyYAML（`apt install python3-yaml`）。
+- 只依赖 `awk`（配置翻译）与下载二进制时的 `curl` / `tar`，不依赖 Python / PyYAML。
 
 ## 手动下载
 
