@@ -13,7 +13,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} ${BOLD}$1${NC}"; }
 
 APP_NAME="sekai"
-SCRIPT_VERSION="20261126.2"
+SCRIPT_VERSION="20261127.1"
 REPO="Fearless743/sekai-release"
 INSTALL_ROOT="/etc/${APP_NAME}"
 CONFIG_FILE="${INSTALL_ROOT}/config.yml"
@@ -77,6 +77,7 @@ usage() {
     --help, -h        显示帮助
 
   支持：glibc（systemd）、Alpine/musl（OpenRC）。Alpine 需先安装 bash。
+   若某版本缺少与本机 libc 匹配的包，会自动回退到同架构的静态 musl 包。
 
   EXAMPLES:
     # 首次安装需传 --license-key；若本地已有 license 缓存或旧配置中的 key，可省略
@@ -263,10 +264,20 @@ download() {
     fi
 }
 
+assets_base_url() {
+    if [ "$RELEASE_VERSION" = "latest" ]; then
+        echo "https://github.com/${REPO}/releases/latest/download"
+    else
+        echo "https://github.com/${REPO}/releases/download/${RELEASE_VERSION}"
+    fi
+}
+
 http_ok() {
     local url="$1"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsS "$url" >/dev/null 2>&1
+        # GitHub 的 releases/download 链接先 302 再指向对象存储；不跟随重定向
+        # 时缺失的包也会返回 302，探测会误判为存在。
+        curl -fsSL "$url" >/dev/null 2>&1
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O /dev/null "$url" 2>/dev/null
     else
@@ -275,7 +286,7 @@ http_ok() {
 }
 
 detect_asset() {
-    local os arch line
+    local os arch candidates candidate base
     os="$(uname -s)"; arch="$(uname -m)"
     case "$os" in
         Linux)  os=linux  ;;
@@ -296,14 +307,33 @@ detect_asset() {
         LIBC="musl"
     fi
 
+    # glibc 主机可运行静态 musl 二进制；部分版本（如 v0.1.3）因 CI 构建失败
+    # 并未发布 x86_64 的 gnu 包，按 libc 硬选名字会让所有 glibc 主机 404。
     case "${os}-${LIBC}-${arch}" in
-        linux-gnu-x86_64)   ASSET="sekai-x86_64-unknown-linux-gnu.tar.gz" ;;
-        linux-gnu-aarch64)  ASSET="sekai-aarch64-unknown-linux-gnu.tar.gz" ;;
-        linux-musl-x86_64)  ASSET="sekai-x86_64-unknown-linux-musl.tar.gz" ;;
-        linux-musl-aarch64) ASSET="sekai-aarch64-unknown-linux-musl.tar.gz" ;;
+        linux-gnu-x86_64)   candidates=("sekai-x86_64-unknown-linux-gnu.tar.gz" "sekai-x86_64-unknown-linux-musl.tar.gz") ;;
+        linux-gnu-aarch64)  candidates=("sekai-aarch64-unknown-linux-gnu.tar.gz" "sekai-aarch64-unknown-linux-musl.tar.gz") ;;
+        linux-musl-x86_64)  candidates=("sekai-x86_64-unknown-linux-musl.tar.gz") ;;
+        linux-musl-aarch64) candidates=("sekai-aarch64-unknown-linux-musl.tar.gz") ;;
         *) log_error "无匹配的安装包: ${os}-${LIBC}-${arch}"; exit 1 ;;
     esac
-    log_info "平台: ${os}/${arch}，libc: ${LIBC}"
+
+    # 没有 curl/wget 时无法探测，保留首选包，交给 stage_binary 报错。
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+        base="$(assets_base_url)"
+        for candidate in "${candidates[@]}"; do
+            if http_ok "${base}/${candidate}"; then
+                ASSET="$candidate"
+                [ "$candidate" = "${candidates[0]}" ] || log_warn "首选包 ${candidates[0]} 在 ${RELEASE_VERSION} 中不存在，改用 ${candidate}"
+                log_info "平台: ${os}/${arch}，libc: ${LIBC}，安装包: ${ASSET}"
+                return 0
+            fi
+        done
+        log_error "版本 ${RELEASE_VERSION} 没有可用的安装包（已尝试: ${candidates[*]}）"
+        exit 1
+    fi
+
+    ASSET="${candidates[0]}"
+    log_info "平台: ${os}/${arch}，libc: ${LIBC}，安装包: ${ASSET}"
 }
 
 # Reuse the key from an existing config so a reinstall does not need
@@ -376,11 +406,7 @@ ensure_dirs() {
 
 stage_binary() {
     local url path
-    if [ "$RELEASE_VERSION" = "latest" ]; then
-        url="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-    else
-        url="https://github.com/${REPO}/releases/download/${RELEASE_VERSION}/${ASSET}"
-    fi
+    url="$(assets_base_url)/${ASSET}"
     path="${TMP_DIR}/${ASSET}"
     log_step "下载 ${RELEASE_VERSION} (${ASSET})"
     download "$url" "$path" || { log_error "下载失败: $url"; exit 1; }
