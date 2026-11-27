@@ -19,8 +19,7 @@
 #   sudo bash migrate-from-fboard-node.sh --keep-old --no-start
 #   sudo bash migrate-from-fboard-node.sh --dry-run
 #
-# Requires: python3 + PyYAML (apt install python3-yaml / pip install pyyaml),
-# curl + tar for downloading a release binary.
+# Requires: awk (POSIX), plus curl + tar when downloading a release binary.
 set -Eeuo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -100,15 +99,8 @@ require_root() {
 }
 
 require_tools() {
-  local missing=0
-  for t in python3; do
-    command -v "$t" >/dev/null 2>&1 || { log_error "Missing required tool: $t"; missing=1; }
-  done
-  if [ "$DRY_RUN" -eq 0 ] && ! python3 -c 'import yaml' >/dev/null 2>&1; then
-    log_error "PyYAML is required for config translation: apt install python3-yaml (or pip install pyyaml)"
-    missing=1
-  fi
-  [ "$missing" -eq 0 ] || exit 1
+  # Config translation uses awk only — no Python / PyYAML dependency.
+  command -v awk >/dev/null 2>&1 || { log_error "Missing required tool: awk"; exit 1; }
 }
 
 detect_init() {
@@ -165,126 +157,172 @@ transform_config() {
     return 0
   fi
 
-  SEKAI_LICENSE_KEY="$LICENSE_KEY" python3 - "$src" "$dst" <<'PY'
-import copy, os, sys
-from pathlib import Path
-
-src, dst = Path(sys.argv[1]), Path(sys.argv[2])
-license_key = os.environ.get("SEKAI_LICENSE_KEY", "").strip() or "FBN-XXXXXXXX-XXXXXXXX"
-text = src.read_text(encoding="utf-8", errors="replace").replace("/etc/fboard-node", "/etc/sekai")
-import yaml  # required, checked by the shell wrapper
-
-warnings = []
-
-def pick(d, keys):
-    if not isinstance(d, dict):
-        return {}
-    return {k: d[k] for k in keys if k in d and d[k] not in (None, "")}
-
-def norm_url(u):
-    u = str(u).strip().rstrip("/")
-    if u.startswith("http://"):
-        host = u.split("/", 3)[2].split(":")[0].lower()
-        if host not in ("localhost", "127.0.0.1", "::1"):
-            warnings.append(
-                f"panel.url 使用 http://{host}，sekai 强制要求 https；已自动改为 https://，请确认面板已开启 TLS"
-            )
-            u = "https://" + u[len("http://"):]
-    return u
-
-def clean_panel(p):
-    out = pick(p, ("url",))
-    if "url" in out:
-        out["url"] = norm_url(out["url"])
-    return out
-
-def clean_machine(m, panel):
-    out = pick(m, ("machine_id", "token", "token_env"))
-    panel = panel if isinstance(panel, dict) else {}
-    if not out.get("machine_id") and panel.get("node_id"):
-        out["machine_id"] = panel["node_id"]   # legacy xboard/fboard node_id
-    if not out.get("token") and not out.get("token_env") and panel.get("token"):
-        out["token"] = panel["token"]          # legacy panel.token
-    return out
-
-def clean_log(l):
-    return pick(l, ("level",))
-
-def clean_ws(w):
-    return pick(w, ("url", "status_interval", "handshake_timeout", "backoff_initial", "backoff_max"))
-
-def clean_node(n):
-    if not isinstance(n, dict):
-        return {}
-    # fboard-node: push_interval (REST report) / pull_interval (reconcile)
-    # sekai:       report_interval / pull_interval
-    mapping = {"push_interval": "report_interval", "report_interval": "report_interval",
-               "pull_interval": "pull_interval"}
-    return {mapping[k]: v for k, v in n.items() if k in mapping}
-
-def clean_limits(x):
-    return pick(x, ("device_limit", "speed_limit"))
-
-def clean_cert(c):
-    return pick(c, ("dir", "acme_email", "acme_dns_provider"))
-
-def clean_instance(raw, base):
-    panel = raw.get("panel") if isinstance(raw.get("panel"), dict) else {}
-    out = {}
-    for key, fn in (("panel", clean_panel), ("machine", None), ("log", clean_log),
-                    ("ws", clean_ws), ("node", clean_node), ("limits", clean_limits),
-                    ("cert", clean_cert)):
-        if key == "machine":
-            val = clean_machine(raw.get("machine"), panel)
-        else:
-            val = fn(raw.get(key))
-        if val:
-            out[key] = val
-    # Fall back to top-level defaults when an instance omits them (mirrors
-    # the reference node's inheritance); sekai does the same at load time,
-    # but doing it here keeps the generated file self-contained.
-    for key in ("panel", "machine", "ws", "node", "limits", "cert"):
-        if key not in out and key in base:
-            out[key] = copy.deepcopy(base[key])  # avoid YAML anchors/aliases
-    return out
-
-data = yaml.safe_load(text)
-if not isinstance(data, dict):
-    data = {}
-
-base = {}
-for key, fn in (("panel", clean_panel), ("log", clean_log), ("ws", clean_ws),
-                ("node", clean_node), ("limits", clean_limits), ("cert", clean_cert)):
-    val = fn(data.get(key))
-    if val:
-        base[key] = val
-machine = clean_machine(data.get("machine"), data.get("panel"))
-if machine:
-    base["machine"] = machine
-if not base.get("cert"):
-    base["cert"] = {"dir": "/etc/sekai/data/certs"}
-
-out = dict(base)
-out["license"] = {
-    "enabled": True,  # compat field; ignored when the license feature is compiled in
-    "key": license_key,
-    "cache_path": "/etc/sekai/data/license.cache",
-    "grace_hours": 72,
-    "renew_hours": 24,
-    "timeout_secs": 15,
+  # Pure awk transformer: no Python / PyYAML needed. Handles both the flat
+  # config and the "instances:" form, keeps token_env, maps legacy fields,
+  # and appends the license/cert sections sekai requires.
+  local tmp awkf
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap 'rm -rf "'"$tmp"'"' RETURN
+  awkf="${tmp}/transform.awk"
+  cat >"$awkf" <<'AWK'
+function indent_of(s,   t) {
+  t = s
+  match(t, /^ */)
+  return RLENGTH
 }
+function eff_indent(s,   t, i) {
+  t = s
+  match(t, /^ */)
+  i = RLENGTH
+  sub(/^ */, "", t)
+  if (t ~ /^- /) i += 2
+  return i
+}
+function key_of(s,   t) {
+  t = s
+  sub(/^ */, "", t)
+  sub(/^- /, "", t)
+  sub(/:.*$/, "", t)
+  return t
+}
+function value_of(s,   t) {
+  t = s
+  sub(/^[^:]*:[[:space:]]*/, "", t)
+  sub(/[[:space:]]+#.*$/, "", t)
+  sub(/^"/, "", t)
+  sub(/"$/, "", t)
+  return t
+}
+function is_block(s,   t) {
+  t = s
+  sub(/^[^:]*:[[:space:]]*/, "", t)
+  return (t == "" || t ~ /^#/)
+}
+function norm_url(u,   h) {
+  sub(/\/+$/, "", u)
+  if (u ~ /^http:\/\//) {
+    h = u
+    sub(/^http:\/\//, "", h)
+    sub(/\/.*$/, "", h)
+    sub(/:.*$/, "", h)
+    if (h != "localhost" && h != "127.0.0.1" && h != "::1") {
+      print "WARN: panel.url uses http://" h "; rewriting to https (sekai requires https)" > "/dev/stderr"
+      u = "https://" substr(u, 8)
+    }
+  }
+  return u
+}
+BEGIN {
+  skip = -1
+  sp = 0
+  saw_machine = 0
+  saw_cert = 0
+  legacy_token = ""
+  legacy_node = ""
+  lk = LICENSE_KEY
+  if (lk == "") lk = "FBN-XXXXXXXX-XXXXXXXX"
+}
+{
+  line = $0
+  gsub(/\/etc\/fboard-node/, "/etc/sekai", line)
+  i = indent_of(line)
 
-instances = data.get("instances")
-if isinstance(instances, list):
-    cleaned = [clean_instance(i, base) for i in instances if isinstance(i, dict)]
-    cleaned = [i for i in cleaned if i.get("machine", {}).get("machine_id")]
-    if cleaned:
-        out["instances"] = cleaned
+  if (skip >= 0) {
+    if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) { print line; next }
+    if (i > skip) next
+    skip = -1
+  }
+  if (line ~ /^[[:space:]]*(#|$)/) { print line; next }
 
-dst.write_text(yaml.safe_dump(out, sort_keys=False, allow_unicode=True), encoding="utf-8")
-for w in warnings:
-    print(w, file=sys.stderr)
-PY
+  ei = eff_indent(line)
+  t = line
+  sub(/^ */, "", t)
+  isitem = (t ~ /^- /)
+  iskey = (t ~ /^[A-Za-z_][A-Za-z0-9_-]*:/ || t ~ /^- [A-Za-z_][A-Za-z0-9_-]*:/)
+  if (!iskey) { print line; next }
+
+  while (sp > 0 && sind[sp] >= ei) sp--
+  key = key_of(line)
+  section = (sp > 0 ? skey[sp] : "")
+  block = is_block(line)
+  rest = value_of(line)
+  allow = 1
+
+  if (key == "kernel" || key == "nodes" || key == "runtime" || key == "standalone") {
+    allow = 0
+    if (isitem) print substr(line, 1, i) "-"
+    if (block) skip = ei
+  } else if (key == "id" || key == "node_type" || key == "data_dir" || key == "health_port" || key == "track_interval" || key == "type" || key == "config_dir" || key == "log_level" || key == "output") {
+    allow = 0
+    # A denied "- id:" is the first key of an instance: keep the list marker
+    # so the following indented keys still form that sequence item.
+    if (isitem) print substr(line, 1, i) "-"
+    if (block) skip = ei
+  } else if (section == "panel") {
+    if (key == "url") {
+      nu = norm_url(rest)
+      if (nu != rest) {
+        p = index(line, rest)
+        if (p > 0) line = substr(line, 1, p - 1) nu substr(line, p + length(rest))
+      }
+    } else {
+      if (sp == 1 && skey[1] == "panel") {
+        if (key == "token") legacy_token = rest
+        if (key == "node_id") legacy_node = rest
+      }
+      allow = 0
+    }
+  } else if (section == "machine") {
+    if (key != "machine_id" && key != "token" && key != "token_env") allow = 0
+  } else if (section == "node") {
+    if (key == "push_interval") {
+      sub(/push_interval/, "report_interval", line)
+    } else if (key != "report_interval" && key != "pull_interval") {
+      allow = 0
+    }
+  } else if (section == "ws") {
+    if (key != "url" && key != "status_interval" && key != "handshake_timeout" && key != "backoff_initial" && key != "backoff_max") allow = 0
+  } else if (section == "log") {
+    if (key != "level") allow = 0
+  } else if (section == "limits") {
+    if (key != "device_limit" && key != "speed_limit") allow = 0
+  } else if (section == "cert") {
+    if (key != "dir" && key != "acme_email" && key != "acme_dns_provider") allow = 0
+  }
+
+  if (allow && block) {
+    sp++
+    skey[sp] = key
+    sind[sp] = ei
+    if (key == "machine" && ei == 0) saw_machine = 1
+    if (key == "cert" && ei == 0) saw_cert = 1
+  }
+  if (allow) print line
+}
+END {
+  if (!saw_machine && (legacy_token != "" || legacy_node != "")) {
+    print ""
+    print "machine:"
+    if (legacy_node != "") print "  machine_id: " legacy_node
+    if (legacy_token != "") print "  token: \"" legacy_token "\""
+  }
+  if (!saw_cert) {
+    print ""
+    print "cert:"
+    print "  dir: /etc/sekai/data/certs"
+  }
+  print ""
+  print "license:"
+  print "  enabled: true"
+  print "  key: \"" lk "\""
+  print "  cache_path: /etc/sekai/data/license.cache"
+  print "  grace_hours: 72"
+  print "  renew_hours: 24"
+  print "  timeout_secs: 15"
+}
+AWK
+  awk -v LICENSE_KEY="$LICENSE_KEY" -f "$awkf" "$src" >"$dst"
   chmod 600 "$dst"
 }
 
